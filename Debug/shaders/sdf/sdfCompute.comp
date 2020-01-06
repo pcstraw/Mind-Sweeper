@@ -1,0 +1,188 @@
+
+#version 440
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(rgba16f,binding=1) uniform volatile coherent image3D voltex;
+layout(rgba16f,binding=5) uniform volatile coherent image2DArray voltexarray;
+uniform float farplane;
+uniform mat4 model;
+uniform mat4 lookat;
+uniform mat4 tet;
+uniform float smoothUnion;
+
+float opUnion(float dist1, float dist2){	return dist1 < dist2 ? dist1 : dist2;}
+float opSub( float d1, float d2 ) { return max(-d1,d2); }
+float opIntersection( float d1, float d2 ) { return max(d1,d2); }
+
+float opSmoothUnion( float d1, float d2, float k ) {
+float h = clamp( 0.5 + 0.5*(d2-d1)/k, 0.0, 1.0 );
+return mix( d2, d1, h ) - k*h*(1.0-h); }
+
+float emin( float a, float b, float k ) {
+    float res = exp2( -k*a ) + exp2( -k*b );
+    return -log2( res )/k; }
+
+float opSmoothSub( float d1, float d2, float k ) {
+    float h = clamp( 0.5 - 0.5*(d2+d1)/k, 0.0, 1.0 );
+    return mix( d2, -d1, h ) + k*h*(1.0-h); }
+
+float opSmoothIntersection( float d1, float d2, float k ) {
+    float h = clamp( 0.5 - 0.5*(d2-d1)/k, 0.0, 1.0 );
+    return mix( d2, d1, h ) + k*h*(1.0-h); }
+
+float sdBox( vec3 p, vec3 pos,vec3 b )
+{
+	vec3 d = abs(p - pos) -  b;
+	return  length(max(d,0.0))
+			+ min(max(d.x,max( d.y,d.z)),0.0);
+}
+
+float sphereDistance(vec3 p,vec3 centre,float radius)
+{
+	return distance(p,centre) - radius;
+}
+
+float sdPlane( vec3 p, vec4 n )
+{
+	// n must be normalized
+	return dot(p,n.xyz) + n.w;
+}
+
+float sdOctahedron( in vec3 p, in float s)
+{
+    p = abs(p);
+    return (p.x +p.y + p.z -s)*0.57735027;
+}
+
+float sdTex(in vec3 p)
+{
+	float d = imageLoad(voltex,ivec3(p)).a;
+	return d;
+}
+
+float dot2( in vec3 v ) { return dot(v,v); }
+float udTriangle( vec3 p, vec3 a, vec3 b, vec3 c )
+{
+    vec3 ba = b - a; vec3 pa = p - a;
+    vec3 cb = c - b; vec3 pb = p - b;
+    vec3 ac = a - c; vec3 pc = p - c;
+    vec3 nor = cross( ba, ac );
+
+    return sqrt(
+    (sign(dot(cross(ba,nor),pa)) +
+     sign(dot(cross(cb,nor),pb)) +
+     sign(dot(cross(ac,nor),pc))<2.0)
+     ?
+     min( min(
+     dot2(ba*clamp(dot(ba,pa)/dot2(ba),0.0,1.0)-pa),
+     dot2(cb*clamp(dot(cb,pb)/dot2(cb),0.0,1.0)-pb) ),
+     dot2(ac*clamp(dot(ac,pc)/dot2(ac),0.0,1.0)-pc) )
+     :
+     dot(nor,pa)*dot(nor,pa)/dot2(nor) );
+}
+
+bool WithinVolume(vec3 pos,float min, float volume)
+{
+	if(pos.x > min && pos.x < volume && pos.y > min && pos.y < volume && pos.z > min && pos.z < volume)
+	return true;
+	return false;
+}
+
+bool WithinBounds(vec3 pos,vec3 min, vec3 max)
+{
+	if(pos.x > min.x && pos.x < max.x && pos.y > min.y && pos.y < max.y && pos.z > min.z && pos.z < max.z)
+	return true;
+	return false;
+}
+
+float sceneSDF(ivec3 cp)
+{
+	float f = farplane;
+	vec3 pos = vec3(cp);
+
+	f = opUnion(sdBox(pos,vec3(0,0,10), vec3(256,10,256)),f);
+	f = opSmoothUnion(sphereDistance(pos,vec3(64,10,64),25),f,25.0);
+	f = opSmoothUnion(sdTex(pos),f,smoothUnion);
+	
+	return f;
+}
+
+vec3 getNormal (vec3 p)
+{
+	const float eps = 0.01;
+	return normalize
+	( vec3
+	( sceneSDF(ivec3(p + vec3(eps, 0, 0)) ) - sceneSDF(ivec3(p - vec3(eps, 0, 0))),
+	sceneSDF(ivec3(p + vec3(0, eps, 0)) ) - sceneSDF(ivec3(p - vec3(0, eps, 0))),
+	sceneSDF(ivec3(p + vec3(0, 0, eps)) ) - sceneSDF(ivec3(p - vec3(0, 0, eps)))
+	)
+	);
+}
+
+vec4 signedSurfaceDistance(ivec3 pos)
+{
+	float f = sceneSDF(pos);
+
+	vec3 col = getNormal(pos);
+
+	return vec4(col,f);
+}
+
+bool WithinTet(ivec3 point)
+{
+	float f = sphereDistance(point,vec3(100,100,100),100);
+	if(f > 0.1)
+		return false;
+	return true;
+/*
+	for(int j=0;j<4;j++)
+	{
+		float d = sdPlane(point,tet[j]);
+		float bound = -1e-15;
+		if(d > 0.0)
+		{
+			//vexel us outside one of the faces, break and move down one vexel
+			return false;
+		}
+	}
+	return true;
+	*/
+}
+
+void FillTexture(ivec3 pos)
+{
+	if(!WithinTet(pos))
+		return;
+
+	vec3 poscol = vec3(pos)/256;
+	imageStore(voltex, pos, vec4(poscol,-1.0));
+	
+	int width = 256;
+	int depth = 256;
+	int d1 = pos.x + width * (pos.y + depth * pos.z);
+	int arraylength = 4096;
+	int x = d1 / arraylength;
+	int y = int(mod(d1,arraylength));
+	//imageStore(voltexarray,ivec3(x,y,0),vec4(poscol,1));
+	
+	//float volumedim = 4096.0;
+	//float halfdim = volumedim/2.0;
+	//vec4 planar = lookat*vec4(vec3(pos),1.0);
+	//ivec3 uvpos = ivec3(ivec2((pos.x/2 + (31 * pos.z)/2),pos.y),0);
+	//ivec3 uvpos = ivec3(ivec2(pos.x,pos.y),0) + ivec3(1/pos.z,1/pos.z,1);
+	//ivec3 uvpos = ivec3(planar.x,planar.y,0);
+	//imageStore(voltexarray,uvpos,vec4(poscol,1));
+}
+
+void main()
+{
+	ivec3 dims = imageSize(voltex);
+
+	ivec3 storePos = ivec3(gl_GlobalInvocationID.xyz);
+
+	vec3 currentPos = gl_WorkGroupID;
+
+	vec4 c = signedSurfaceDistance(storePos);
+	imageStore(voltex, storePos, c);
+	//FillTexture(storePos);
+}
